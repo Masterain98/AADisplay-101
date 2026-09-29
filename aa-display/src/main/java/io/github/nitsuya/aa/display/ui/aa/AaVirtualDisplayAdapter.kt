@@ -34,6 +34,7 @@ import io.github.nitsuya.aa.display.util.tryOrNull
 import io.github.nitsuya.aa.display.service.IShellManager
 import io.github.nitsuya.aa.display.xposed.CoreManagerService
 import io.github.nitsuya.aa.display.xposed.TipUtil
+import io.github.nitsuya.aa.display.xposed.hook.AndroidHook
 import io.github.nitsuya.aa.display.xposed.log
 import io.github.nitsuya.aa.display.xposed.util.Instances
 import io.github.nitsuya.template.bases.runMain
@@ -55,6 +56,12 @@ class AaVirtualDisplayAdapter(
 
         private const val INJECT_INPUT_EVENT_MODE_ASYNC = 0
         private const val INJECT_INPUT_EVENT_MODE_WAIT_FOR_RESULT = 1
+        private const val VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH = 1 shl 6
+        private const val VIRTUAL_DISPLAY_FLAG_TRUSTED = 1 shl 10
+        private const val VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP = 1 shl 11
+        private const val VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED = 1 shl 12
+        private const val VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED = 1 shl 13
+        private const val VIRTUAL_DISPLAY_FLAG_OWN_FOCUS = 1 shl 14
     }
 
     /** Default launch package name: the app package to launch when virtual display is created, can be null */
@@ -112,24 +119,27 @@ class AaVirtualDisplayAdapter(
     @SuppressLint("WrongConstant")
     fun onConnected(width: Int, height: Int, densityDpi: Int, onVirtualDisplayCreated: ((Int) -> Unit)) {
         val indent = Binder.clearCallingIdentity()
+        val displayName = "AADisplay-${System.currentTimeMillis()}"
         try {
+            AndroidHook.DisplayGroupIsolation.expect(displayName)
             mVirtualDisplay = Instances.displayManager.createVirtualDisplay(
-                "AADisplay-${System.currentTimeMillis()}",
+                displayName,
                 width,
                 height,
                 densityDpi,
                 null,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
-                    or DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE
                     or DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
                     or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
-                    //or (1 shl 8) //DisplayManager.VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL
-                    or (1 shl 10) //DisplayManager.VIRTUAL_DISPLAY_FLAG_TRUSTED
-                    or (1 shl 11) //DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
-                    or (1 shl 12) //DisplayManager.VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED
-                    or (1 shl 13) //DisplayManager.VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED
+                    or VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
+                    or VIRTUAL_DISPLAY_FLAG_TRUSTED
+                    or VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
+                    or VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED
+                    or VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED
+                    or VIRTUAL_DISPLAY_FLAG_OWN_FOCUS
             )
         } finally {
+            AndroidHook.DisplayGroupIsolation.release(displayName)
             Binder.restoreCallingIdentity(indent)
         }
         mDisplayId = mVirtualDisplay.display.displayId
@@ -148,16 +158,17 @@ class AaVirtualDisplayAdapter(
             "showWithInsecureKeyguard=true, showSystemDecors=false, " +
             "imePolicy=${AADisplayConfig.DisplayImePolicy.get(config)}")
         AADisplayLogger.log(TAG, "VD created: displayId=$mDisplayId, imePolicy=${AADisplayConfig.DisplayImePolicy.get(config)}")
-        //mDisplayWindowManager = context.createDisplayContext(mVirtualDisplay.display).getSystemService(WindowManager::class.java).apply {
         mDisplayWindowManager = context.createDisplayContext(mVirtualDisplay.display).createWindowContext(mVirtualDisplay.display, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null).getSystemService(WindowManager::class.java).apply {
             addView(
                 mForceView,
                 WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    1,
+                    1,
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                            or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                            or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                     PixelFormat.TRANSPARENT
                 ).also {
                     it.gravity = Gravity.START or Gravity.TOP
@@ -166,9 +177,6 @@ class AaVirtualDisplayAdapter(
                     } else {
                         ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                     }
-                    it.alpha = 0f
-                    it.width = 0
-                    it.height = 0
                 }
             )
         }

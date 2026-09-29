@@ -36,6 +36,7 @@ object AndroidHook : BaseHook() {
         hookPackageService(ctx)
         hookActivityManagerService(ctx)
         hookDisplayLaunchPermission(ctx)
+        hookDisplayGroupIsolation(ctx)
     }
 
     private fun hookPackageService(ctx: XposedRuntimeContext) {
@@ -171,6 +172,21 @@ object AndroidHook : BaseHook() {
         }
     }
 
+    private fun hookDisplayGroupIsolation(ctx: XposedRuntimeContext) {
+        runCatching {
+            val method = ctx.findAllMethods("com.android.server.display.LogicalDisplayMapper") {
+                name.startsWith("assignDisplayGroup") && parameterCount == 1
+            }.firstOrNull() ?: throw NoSuchMethodException("LogicalDisplayMapper.assignDisplayGroup*(LogicalDisplay)")
+
+            ctx.hookBefore(method) { param ->
+                DisplayGroupIsolation.claimIfExpected(param.args.getOrNull(0))
+            }
+            log(tagName, "display group isolation hook installed: ${method.name}")
+        }.onFailure {
+            log(tagName, "display group isolation hook failed", it)
+        }
+    }
+
     object Power {
         private var hookPower: ManagedHookHandle? = null
 
@@ -209,6 +225,41 @@ object AndroidHook : BaseHook() {
         fun unHook() {
             hookPower?.unhook()
             hookPower = null
+        }
+    }
+
+    object DisplayGroupIsolation {
+        private const val DISPLAY_NAME_PREFIX = "AADisplay-"
+        private const val GROUP_NAME_PREFIX = "io.github.nitsuya.aadisplay.projection."
+
+        private val expectedDisplays = Collections.synchronizedSet(mutableSetOf<String>())
+
+        fun expect(displayName: String) {
+            expectedDisplays += displayName
+        }
+
+        fun release(displayName: String) {
+            expectedDisplays -= displayName
+        }
+
+        fun claimIfExpected(logicalDisplay: Any?) {
+            if (logicalDisplay == null) return
+            runCatching {
+                val groupName = logicalDisplay.invokeMethod("getLayoutGroupNameLocked") as? String
+                if (!groupName.isNullOrEmpty()) return
+
+                val displayDevice = logicalDisplay.invokeMethod("getPrimaryDisplayDeviceLocked") ?: return
+                val displayDeviceInfo = displayDevice.invokeMethod("getDisplayDeviceInfoLocked") ?: return
+                val displayName = displayDeviceInfo.getObject("name") as? String ?: return
+                if (!displayName.startsWith(DISPLAY_NAME_PREFIX) || !expectedDisplays.contains(displayName)) return
+
+                val newGroupName = GROUP_NAME_PREFIX + displayName.removePrefix(DISPLAY_NAME_PREFIX)
+                logicalDisplay.invokeMethod("setDisplayGroupNameLocked", newGroupName)
+                expectedDisplays -= displayName
+                log(tagName, "display group isolated: $displayName -> $newGroupName")
+            }.onFailure {
+                log(tagName, "display group isolation failed", it)
+            }
         }
     }
 

@@ -11,6 +11,7 @@ import io.github.nitsuya.aa.display.ui.aa.AaVirtualDisplayAdapter
 import io.github.nitsuya.aa.display.ui.window.DisplayWindow
 import io.github.nitsuya.aa.display.util.AADisplayConfig
 import io.github.nitsuya.aa.display.util.AADisplayLogger
+import io.github.nitsuya.aa.display.util.ProjectionOwner
 import io.github.nitsuya.aa.display.xposed.util.Instances
 import io.github.nitsuya.template.bases.runIO
 import io.github.nitsuya.template.bases.runMain
@@ -54,7 +55,10 @@ class CoreManagerService private constructor(): ICoreManager.Stub() {
             }
 
         private var mDisplayWindow: DisplayWindow? = null
-        private var mAaVirtualDisplayAdapter: AaVirtualDisplayAdapter? = null
+        private val projectionOwner = ProjectionOwner<AaVirtualDisplayAdapter>()
+        private var mAaVirtualDisplayAdapter: AaVirtualDisplayAdapter?
+            get() = projectionOwner.current
+            set(value) { projectionOwner.current = value }
 
         /**
          * Synchronous display power toggle for use from power button hook.
@@ -149,25 +153,48 @@ class CoreManagerService private constructor(): ICoreManager.Stub() {
 
     override fun onCreateDisplay(width: Int, height: Int, densityDpi: Int, listener: IVirtualDisplayCreatedListener){
         runMain {
-            mAaVirtualDisplayAdapter?.apply {
+            mAaVirtualDisplayAdapter?.takeIf { it.isReady }?.apply {
                 onReconnected(width, height, densityDpi)
-                mDisplayWindow?.onResume(width, height)
-                listener.onAvailableDisplay(this.mDisplayId, false)
+                runCatching { mDisplayWindow?.onResume(width, height) }
+                    .onFailure { log(TAG, "auxiliary reconnect failed; core display remains usable", it) }
+                if (projectionOwner.current === this && isReady) runCatching {
+                    listener.onAvailableDisplay(this.mDisplayId, false)
+                }.onFailure { log(TAG, "display reconnect listener unavailable", it) }
                 return@runMain
+            }
+            // A pending bind belongs to a session too. Retire it before accepting a newer request.
+            mAaVirtualDisplayAdapter?.let { pending ->
+                if (projectionOwner.clear(pending)) pending.onDestroy()
             }
             configProvider.reload()
             cachedConfig = null
             config?.apply {
                 log(TAG, "config: ${this.all.map { "${it.key}=${it.value}[${it.value?.javaClass?.name}]" }.joinToString() }")
             }
-            AaVirtualDisplayAdapter(systemContext, config){
-                mAaVirtualDisplayAdapter = this
-                onConnected(width, height, densityDpi){ displayId ->
-                    listener.onAvailableDisplay(displayId, true)
+            val adapter = AaVirtualDisplayAdapter(systemContext, config, onReady = {
+                if (projectionOwner.current !== this) {
+                    onDestroy()
+                    return@AaVirtualDisplayAdapter
                 }
-                mDisplayWindow?.onDestroyPromptly()
-                mDisplayWindow = DisplayWindow(CommonContextWrapper.createAppCompatContext(systemContext), this, width, height, densityDpi)
-            }
+                onConnected(width, height, densityDpi) { displayId ->
+                    if (projectionOwner.current === this && isReady) runCatching {
+                        listener.onAvailableDisplay(displayId, true)
+                    }.onFailure { log(TAG, "display ready listener unavailable", it) }
+                }
+                if (projectionOwner.current === this && isReady) {
+                    runCatching {
+                        mDisplayWindow?.onDestroyPromptly()
+                        if (projectionOwner.current === this && isReady) {
+                            mDisplayWindow = DisplayWindow(CommonContextWrapper.createAppCompatContext(systemContext), this, width, height, densityDpi)
+                        }
+                    }.onFailure { log(TAG, "auxiliary display controls unavailable; core display remains usable", it) }
+                }
+            }, onFailure = { failed ->
+                // A late failure from a retired bind must not clear a newer adapter.
+                projectionOwner.clear(failed)
+            })
+            mAaVirtualDisplayAdapter = adapter
+            adapter.initialize()
         }
     }
 
@@ -179,10 +206,19 @@ class CoreManagerService private constructor(): ICoreManager.Stub() {
 
     override fun onDestroyDisplay(){
         runMain {
-            mDisplayWindow?.onDestroy {
-                mAaVirtualDisplayAdapter?.onDestroy()
-                mDisplayWindow = null
-                mAaVirtualDisplayAdapter = null
+            val adapter = mAaVirtualDisplayAdapter ?: return@runMain
+            val window = mDisplayWindow
+            val cleanup = {
+                if (projectionOwner.clear(adapter)) {
+                    adapter.onDestroy()
+                    if (mDisplayWindow === window) mDisplayWindow = null
+                }
+            }
+            if (window == null) cleanup() else runCatching {
+                window.onDestroy(cleanup)
+            }.onFailure {
+                log(TAG, "auxiliary teardown failed; releasing core session", it)
+                cleanup()
             }
         }
     }
@@ -235,20 +271,17 @@ class CoreManagerService private constructor(): ICoreManager.Stub() {
     }
 
     override fun pressKey(action: Int) {
+        val adapter = mAaVirtualDisplayAdapter
         runIO {
-            mAaVirtualDisplayAdapter?.onPressKey(action)
+            adapter?.onPressKey(action)
         }
     }
 
     override fun touch(event: MotionEvent) {
-        log(TAG, "CoreManagerService.touch: action=${event.action}, " +
-            "x=${event.x}, y=${event.y}, pointerCount=${event.pointerCount}, " +
-            "adapter=${mAaVirtualDisplayAdapter != null}, " +
-            "displayId=${mAaVirtualDisplayAdapter?.mDisplayId}")
-        AADisplayLogger.log(TAG, "touch: action=${event.action}, x=${event.x}, y=${event.y}, displayId=${mAaVirtualDisplayAdapter?.mDisplayId}")
+        val adapter = mAaVirtualDisplayAdapter
         runBlocking(Dispatchers.IO) {
 //        runMain {
-            mAaVirtualDisplayAdapter?.onTouch(event)
+            adapter?.onTouch(event)
         }
     }
 

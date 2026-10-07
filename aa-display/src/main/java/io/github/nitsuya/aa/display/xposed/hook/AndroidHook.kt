@@ -10,6 +10,8 @@ import android.view.Display
 import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.IsSystemEnv
 import io.github.nitsuya.aa.display.util.AADisplayConfig
+import io.github.nitsuya.aa.display.util.ProjectionCompatibility
+import io.github.nitsuya.aa.display.util.DisplayCreationNames
 import io.github.nitsuya.aa.display.xposed.BridgeService
 import io.github.nitsuya.aa.display.xposed.CoreManagerService
 import io.github.nitsuya.aa.display.xposed.ManagedHookHandle
@@ -21,6 +23,9 @@ import io.github.nitsuya.aa.display.xposed.invokeMethod
 import io.github.nitsuya.aa.display.xposed.log
 import io.github.qauxv.util.Initiator
 import java.util.Collections
+import java.lang.reflect.Method
+import java.lang.reflect.Field
+import java.lang.reflect.Modifier
 
 object AndroidHook : BaseHook() {
     override val tagName: String = "AAD_AndroidHook"
@@ -119,69 +124,58 @@ object AndroidHook : BaseHook() {
     }
 
     private fun hookDisplayLaunchPermission(ctx: XposedRuntimeContext) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
-
-        val className = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            "com.android.server.wm.ActivityTaskSupervisor"
-        } else {
-            "com.android.server.wm.ActivityStackSupervisor"
-        }
-
-        // Hook isCallerAllowedToLaunchOnDisplay (pre-Android 17 path)
+        val className = "com.android.server.wm.ActivityTaskSupervisor"
         runCatching {
-            ctx.hookAfter(ctx.findMethod(className) {
-                name == "isCallerAllowedToLaunchOnDisplay"
-                    && parameterCount == 4
-                    && parameterTypes[0] == Int::class.javaPrimitiveType
-                    && parameterTypes[1] == Int::class.javaPrimitiveType
-                    && parameterTypes[2] == Int::class.javaPrimitiveType
-                    && parameterTypes[3] == ActivityInfo::class.java
-            }) { param ->
-                val targetDisplayId = CoreManagerService.getDisplayId()
-                if (targetDisplayId == Display.INVALID_DISPLAY) return@hookAfter
-                if (param.result == false && param.args.getOrNull(2) == targetDisplayId) {
+            val methods = ctx.loadClass(className).declaredMethods.asIterable()
+            val intType = Integer.TYPE
+            val selected = ProjectionCompatibility.selectLaunchPermission(methods, ActivityInfo::class.java) {
+                ctx.loadClass("com.android.server.wm.TaskDisplayArea")
+            } ?: error("missing or ambiguous launch permission signature")
+            var taskAreaDisplayId: Method? = null
+            if (selected.name == "isCallerAllowedToLaunchOnTaskDisplayArea") {
+                val taskArea = ctx.loadClass("com.android.server.wm.TaskDisplayArea")
+                taskAreaDisplayId = ProjectionCompatibility.select(taskArea.methods.asIterable(),
+                    "getDisplayId", intType).method ?: error("missing or ambiguous TaskDisplayArea.getDisplayId")
+            }
+            ctx.hookAfter(selected) { param ->
+                if (param.result != false) return@hookAfter
+                val requestedDisplay = if (taskAreaDisplayId == null) param.args.getOrNull(2) as? Int else {
+                    runCatching { taskAreaDisplayId.invoke(param.args.getOrNull(2)) as? Int }.getOrNull()
+                }
+                if (ProjectionCompatibility.allowProjectionLaunch(param.result, CoreManagerService.getDisplayId(), requestedDisplay)) {
                     param.result = true
-                    log(tagName, "hook isCallerAllowedToLaunchOnDisplay success")
                 }
             }
+            log(tagName, "display launch permission hook installed: ${selected.name}")
         }.onFailure {
-            log(tagName, "$className.isCallerAllowedToLaunchOnDisplay", it)
-        }
-
-        // Hook isCallerAllowedToLaunchOnTaskDisplayArea (Android 17+ path)
-        runCatching {
-            ctx.findAllMethods(className) {
-                name == "isCallerAllowedToLaunchOnTaskDisplayArea"
-            }.forEach { m ->
-                ctx.hookAfter(m) { param ->
-                    val targetDisplayId = CoreManagerService.getDisplayId()
-                    if (targetDisplayId == Display.INVALID_DISPLAY) return@hookAfter
-                    // arg[2] is TaskDisplayArea - extract displayId via getDisplayId()
-                    val taskDisplayArea = param.args.getOrNull(2) ?: return@hookAfter
-                    val displayId = runCatching {
-                        taskDisplayArea.invokeMethod("getDisplayId") as? Int
-                    }.getOrNull() ?: return@hookAfter
-                    if (displayId == targetDisplayId && param.result == false) {
-                        param.result = true
-                        log(tagName, "hook isCallerAllowedToLaunchOnTaskDisplayArea success (displayId=$displayId)")
-                    }
-                }
-            }
-        }.onFailure {
-            log(tagName, "$className.isCallerAllowedToLaunchOnTaskDisplayArea", it)
+            log(tagName, "display launch permission feature disabled", it)
         }
     }
 
     private fun hookDisplayGroupIsolation(ctx: XposedRuntimeContext) {
+        val getterName = ProjectionCompatibility.groupGetter(Build.VERSION.SDK_INT) ?: return
         runCatching {
-            val method = ctx.findAllMethods("com.android.server.display.LogicalDisplayMapper") {
-                name.startsWith("assignDisplayGroup") && parameterCount == 1
-            }.firstOrNull() ?: throw NoSuchMethodException("LogicalDisplayMapper.assignDisplayGroup*(LogicalDisplay)")
-
-            ctx.hookBefore(method) { param ->
-                DisplayGroupIsolation.claimIfExpected(param.args.getOrNull(0))
+            val logical = ctx.loadClass("com.android.server.display.LogicalDisplay")
+            val device = ctx.loadClass("com.android.server.display.DisplayDevice")
+            val info = ctx.loadClass("com.android.server.display.DisplayDeviceInfo")
+            fun required(type: Class<*>, name: String, result: Class<*>, vararg params: Class<*>): Method =
+                ProjectionCompatibility.select(type.declaredMethods.asIterable(), name, result, *params).method
+                    ?: error("missing or ambiguous ${type.simpleName}.$name")
+            val getter = required(logical, getterName, String::class.java)
+            val setter = required(logical, "setDisplayGroupNameLocked", Void.TYPE, String::class.java)
+            val primary = required(logical, "getPrimaryDisplayDeviceLocked", device)
+            val deviceInfo = required(device, "getDisplayDeviceInfoLocked", info)
+            val name = info.getDeclaredField("name").also {
+                check(it.type == String::class.java && !Modifier.isStatic(it.modifiers))
+                it.isAccessible = true
             }
-            log(tagName, "display group isolation hook installed: ${method.name}")
+            val method = required(ctx.loadClass("com.android.server.display.LogicalDisplayMapper"),
+                "assignDisplayGroupLocked", Void.TYPE, logical)
+            val members = DisplayGroupIsolation.Members(getter, setter, primary, deviceInfo, name)
+            ctx.hookBefore(method) { param ->
+                DisplayGroupIsolation.claimIfExpected(param.args.getOrNull(0), members)
+            }
+            log(tagName, "auxiliary display group naming installed: sdk=${Build.VERSION.SDK_INT}, getter=$getterName")
         }.onFailure {
             log(tagName, "display group isolation hook failed", it)
         }
@@ -232,31 +226,26 @@ object AndroidHook : BaseHook() {
         private const val DISPLAY_NAME_PREFIX = "AADisplay-"
         private const val GROUP_NAME_PREFIX = "io.github.nitsuya.aadisplay.projection."
 
-        private val expectedDisplays = Collections.synchronizedSet(mutableSetOf<String>())
+        private val displayNames = DisplayCreationNames()
 
-        fun expect(displayName: String) {
-            expectedDisplays += displayName
-        }
+        fun <T> duringCreation(displayName: String, create: () -> T): T =
+            displayNames.duringCreation(displayName, create)
 
-        fun release(displayName: String) {
-            expectedDisplays -= displayName
-        }
+        data class Members(val getter: Method, val setter: Method, val primary: Method, val info: Method, val name: Field)
 
-        fun claimIfExpected(logicalDisplay: Any?) {
+        fun claimIfExpected(logicalDisplay: Any?, members: Members) {
             if (logicalDisplay == null) return
             runCatching {
-                val groupName = logicalDisplay.invokeMethod("getLayoutGroupNameLocked") as? String
+                val groupName = members.getter.invoke(logicalDisplay) as? String
                 if (!groupName.isNullOrEmpty()) return
-
-                val displayDevice = logicalDisplay.invokeMethod("getPrimaryDisplayDeviceLocked") ?: return
-                val displayDeviceInfo = displayDevice.invokeMethod("getDisplayDeviceInfoLocked") ?: return
-                val displayName = displayDeviceInfo.getObject("name") as? String ?: return
-                if (!displayName.startsWith(DISPLAY_NAME_PREFIX) || !expectedDisplays.contains(displayName)) return
+                val displayDevice = members.primary.invoke(logicalDisplay) ?: return
+                val displayDeviceInfo = members.info.invoke(displayDevice) ?: return
+                val displayName = members.name.get(displayDeviceInfo) as? String ?: return
+                if (!displayNames.canName(groupName, displayName)) return
 
                 val newGroupName = GROUP_NAME_PREFIX + displayName.removePrefix(DISPLAY_NAME_PREFIX)
-                logicalDisplay.invokeMethod("setDisplayGroupNameLocked", newGroupName)
-                expectedDisplays -= displayName
-                log(tagName, "display group isolated: $displayName -> $newGroupName")
+                members.setter.invoke(logicalDisplay, newGroupName)
+                log(tagName, "auxiliary display group name requested: $displayName -> $newGroupName")
             }.onFailure {
                 log(tagName, "display group isolation failed", it)
             }

@@ -22,6 +22,7 @@ import io.github.nitsuya.aa.display.databinding.WindowMirrorBinding
 import io.github.nitsuya.aa.display.ui.aa.AaVirtualDisplayAdapter
 import io.github.nitsuya.aa.display.util.AADisplayConfig
 import io.github.nitsuya.aa.display.util.AADisplayLogger
+import io.github.nitsuya.aa.display.util.AcquiredResource
 import io.github.nitsuya.aa.display.util.tryOrNull
 import io.github.nitsuya.aa.display.xposed.CoreManagerService
 import io.github.nitsuya.aa.display.xposed.TipUtil
@@ -83,13 +84,11 @@ class DisplayWindow(
 
     private val isSupportInteractive = RomUtil.isMiui()
     private var interactiveMonitor = object: BroadcastReceiver(){
-        val monitor by lazy {
-            Instances.powerManagerHidden.newWakeLock(
-                        PowerManager.SCREEN_BRIGHT_WAKE_LOCK
-                , "${BuildConfig.APPLICATION_ID}:Monitor", displayAdapter.mVirtualDisplay.display.displayId).apply {
-                    setReferenceCounted(false)
-            }
-        }
+        private var monitor: PowerManager.WakeLock? = null
+        private val wakeLock = AcquiredResource()
+        private val receiver = AcquiredResource()
+        private val powerHook = AcquiredResource()
+        private val contextHooks = AcquiredResource()
         fun addAction(intentFilter: IntentFilter): IntentFilter {
             return intentFilter.apply {
                 addAction(Intent.ACTION_SCREEN_ON)
@@ -115,28 +114,42 @@ class DisplayWindow(
             } catch (e : Throwable){}
         }
         fun init(){
-            if(mScreenOffReplaceLockScreen){
-                AndroidHook.Power.hook()
-            } else if(isSupportInteractive){
-                mContext.registerReceiver(this, addAction(IntentFilter()))
-                onReceive(mContext, if(Instances.powerManager.isInteractive) Intent.ACTION_SCREEN_ON else Intent.ACTION_SCREEN_OFF)
-            } else {
-                if (!monitor.isHeld) {
-                    monitor.acquire()
+            try {
+                if(mScreenOffReplaceLockScreen){
+                    powerHook.acquire({ AndroidHook.Power.hook() }, { AndroidHook.Power.unHook() })
+                } else if(isSupportInteractive){
+                    receiver.acquire({ mContext.registerReceiver(this, addAction(IntentFilter())) }, {
+                        mContext.unregisterReceiver(this)
+                    })
+                    onReceive(mContext, if(Instances.powerManager.isInteractive) Intent.ACTION_SCREEN_ON else Intent.ACTION_SCREEN_OFF)
+                } else {
+                    wakeLock.acquire({
+                        val acquiredMonitor = monitor ?: Instances.powerManagerHidden.newWakeLock(
+                            PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
+                            "${BuildConfig.APPLICATION_ID}:Monitor", displayAdapter.mDisplayId
+                        ).apply { setReferenceCounted(false) }.also { monitor = it }
+                        if (!acquiredMonitor.isHeld) acquiredMonitor.acquire()
+                    }, { monitor?.takeIf { it.isHeld }?.release() })
                 }
+                contextHooks.acquire({ AndroidHook.FuckAppUseApplicationContext.hook() }, {
+                    AndroidHook.FuckAppUseApplicationContext.unHook()
+                })
+            } catch (error: Throwable) {
+                release()
+                throw error
             }
-            AndroidHook.FuckAppUseApplicationContext.hook()
         }
         fun release(){
-            if(mScreenOffReplaceLockScreen){
-                AndroidHook.Power.unHook()
-            } else if(isSupportInteractive){
+            fun report(name: String, error: Throwable?) {
+                if (error != null) log(TAG, "auxiliary $name cleanup failed", error)
+            }
+            report("power hook", powerHook.release { AndroidHook.Power.unHook() })
+            report("receiver", receiver.release {
                 mContext.unregisterReceiver(this)
                 onReceive(mContext, Intent.ACTION_SCREEN_ON)
-            } else {
-                monitor.release()
-            }
-            AndroidHook.FuckAppUseApplicationContext.unHook()
+            })
+            report("wake lock", wakeLock.release { monitor?.takeIf { it.isHeld }?.release() })
+            report("context hooks", contextHooks.release { AndroidHook.FuckAppUseApplicationContext.unHook() })
         }
     }
 
@@ -150,16 +163,18 @@ class DisplayWindow(
                     llRecentTask.setPadding(0, getStatusBarHeight(), 0, 0)
                 }
             }
+            doInit()
+            interactiveMonitor.init()
+            log(TAG, "DisplayWindow init: ScreenOffReplaceLockScreen=$mScreenOffReplaceLockScreen, " +
+                "interactive=${Instances.powerManager.isInteractive}, displayId=${displayAdapter.mDisplayId}")
         }.onFailure {
+            interactiveMonitor.release()
+            close()
+            mControllerBinding = null
+            mMirrorBinding = null
             log(TAG, "init: new window failed may you forget reboot", it)
             TipUtil.showToast("new window failed\nmay you forget reboot")
-        }.onSuccess {
-            doInit()
         }
-        interactiveMonitor.init()
-        log(TAG, "DisplayWindow init: ScreenOffReplaceLockScreen=$mScreenOffReplaceLockScreen, " +
-            "interactive=${Instances.powerManager.isInteractive}, " +
-            "displayId=${displayAdapter.mVirtualDisplay.display.displayId}")
     }
 
     fun doInit() {
@@ -385,7 +400,7 @@ class DisplayWindow(
         toggleDisplayPower(true)
         mDestroyJob?.cancelAndJoin()
 
-        if(mDelayDestroyTime == 0){
+        if(mDelayDestroyTime == 0 || mControllerBinding == null){
             close()
             onDestroySucceed()
             return
@@ -651,9 +666,11 @@ class DisplayWindow(
         }
         if(mControllerStatus) return
         mControllerBinding?.apply {
-            tryOrNull { Instances.windowManager.addView(root, mControllerLayoutParams) }
+            runCatching {
+                Instances.windowManager.addView(root, mControllerLayoutParams)
+                mControllerStatus = true
+            }.onFailure { log(TAG, "auxiliary controller view unavailable", it) }
             mChangeAlphaCountDownTimer.start()
-            mControllerStatus = true
         }
     }
     private fun hideController(){
@@ -668,8 +685,10 @@ class DisplayWindow(
         if(mMirrorStatus) return
         hideRecentTask()
         mMirrorBinding?.apply {
-            tryOrNull { Instances.windowManager.addView(root, mMirrorLayoutParams) }
-            mMirrorStatus = true
+            runCatching {
+                Instances.windowManager.addView(root, mMirrorLayoutParams)
+                mMirrorStatus = true
+            }.onFailure { log(TAG, "auxiliary mirror view unavailable", it) }
         }
     }
     private fun hideMirror(){

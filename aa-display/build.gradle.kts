@@ -1,15 +1,10 @@
 import java.util.zip.ZipFile
 
-val versionConf = rootDir.resolve("version.conf").let { file ->
-    if (file.exists()) file.readLines()
-        .filter { it.isNotBlank() && !it.startsWith("#") }
-        .map { it.split("=", limit = 2).map(String::trim) }
-        .filter { it.size == 2 }
-        .associate { it[0] to it[1] }
-    else emptyMap()
-}
-val confVersionName = versionConf["VERSION_NAME"] ?: "1.0.0-dev"
-val confVersionCode = versionConf["VERSION_CODE"]?.toIntOrNull() ?: 1
+// Release CI supplies calendar versions; local builds keep development defaults.
+val confVersionName = providers.environmentVariable("AADISPLAY_VERSION_NAME").orElse("1.0.0-dev").get()
+val confVersionCode = providers.environmentVariable("AADISPLAY_VERSION_CODE").orElse("1").get().toInt()
+require(confVersionName.isNotBlank()) { "AADISPLAY_VERSION_NAME must not be blank" }
+require(confVersionCode in 1..2_100_000_000) { "AADISPLAY_VERSION_CODE is outside the supported Android range" }
 
 plugins {
     id("com.android.application")

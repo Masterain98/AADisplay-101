@@ -11,6 +11,26 @@ An Xposed / LSPosed module that mirrors almost any app onto the Android Auto scr
 > [!IMPORTANT]
 > AADisplay-101 has GitHub Immutable Releases feature enabled. All APK releases are exclusively built and published through GitHub Actions CI — they cannot be manually modified, ensuring software supply chain security.
 
+## Release versioning
+
+Run the **Release** workflow manually in GitHub Actions. Pushes do not publish releases.
+CI generates versions using the Asia/Taipei (UTC+8) calendar date: `2026.10.7.0`
+is the first version on October 7, followed by `2026.10.7.1`. The next day starts
+at `2026.10.8.0`. Tags use the `v` prefix, for example `v2026.10.7.0`.
+
+Published tags and release drafts both occupy sequence numbers. CI uses the
+highest existing number plus one, serializes release runs, and generates a
+strictly increasing Android `VERSION_CODE` with up to 1000 versions per day.
+A failed build before a tag or draft is created does not consume a number;
+an existing draft or tag is preserved and the next run chooses another number.
+The APK version, filename, tag, and release title all use the generated version.
+
+The manual workflow's `prerelease` option controls the GitHub prerelease flag
+and defaults to `true`. CI passes the generated values to Gradle through
+`AADISPLAY_VERSION_NAME` and `AADISPLAY_VERSION_CODE`; it does not commit or push
+version updates. Local builds default to `1.0.0-dev` with version code `1`.
+The internal version code is `days since 2000-01-01 * 1000 + daily index + 1`.
+
 ## Upstream
 
 This project is forked from [`koalaauto/AADisplay-Beta`](https://github.com/koalaauto/AADisplay-Beta), which itself derives from [`Nitsuya/AADisplay`](https://github.com/Nitsuya/AADisplay).

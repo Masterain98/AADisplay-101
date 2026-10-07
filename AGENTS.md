@@ -27,7 +27,7 @@ The user-facing product name is **AADisplay-101**. The application ID is `com.aa
 | `aa-display/src/main/aidl/` | Cross-process Binder contracts |
 | `aa-display/src/main/resources/META-INF/xposed/` | API 101 module metadata, entry point, and static scope |
 | `lib-stub/` | Compile-only hidden Android framework stubs; never runtime implementation code |
-| `version.conf` | CI release version and prerelease state |
+| `.github/scripts/generate_release_version.py` | CI calendar version allocation |
 | `.github/workflows/release.yml` | Signed, immutable GitHub release pipeline |
 
 Current build baseline:
@@ -273,7 +273,7 @@ Before handing off any change:
 ```powershell
 git diff --check
 git status --short
-git diff -- AGENTS.md aa-display lib-stub version.conf .github
+git diff -- AGENTS.md README.md aa-display lib-stub .github
 ```
 
 Adjust the final diff command to the files in scope. Report which checks ran, their result, and what could not be tested.
@@ -344,9 +344,9 @@ If only one device/version is available, state that limitation. Do not convert a
 
 ## 10. Release Discipline
 
-`version.conf` is release control, not a general build file. A push to `main` that changes it triggers the signed GitHub Actions release workflow.
+Releases are triggered only by manually running the Release workflow. CI generates `year.month.day.index` versions using Asia/Taipei (UTC+8), with the daily index starting at zero. Existing tags and release drafts occupy indices. The workflow serializes allocation through publication and passes `AADISPLAY_VERSION_NAME` / `AADISPLAY_VERSION_CODE` to Gradle; local builds use development defaults. The manual `prerelease` input defaults to true. There is no `version.conf` and pushes do not trigger releases.
 
-- Change `VERSION_NAME`, `VERSION_CODE`, or `PRERELEASE` only when the user explicitly requests release preparation.
+- Change the version allocation policy or trigger the release workflow only when the user explicitly requests it.
 - `VERSION_CODE` must increase monotonically; `VERSION_NAME` must produce a new `v<VERSION_NAME>` tag.
 - Never use local debug signing for a release claim.
 - Never expose, print, copy into the repository, or request the contents of signing secrets.

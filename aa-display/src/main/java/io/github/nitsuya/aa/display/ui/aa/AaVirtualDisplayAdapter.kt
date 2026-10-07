@@ -122,22 +122,16 @@ class AaVirtualDisplayAdapter(
         val displayName = "AADisplay-${System.currentTimeMillis()}"
         try {
             AndroidHook.DisplayGroupIsolation.expect(displayName)
-            mVirtualDisplay = Instances.displayManager.createVirtualDisplay(
-                displayName,
-                width,
-                height,
-                densityDpi,
-                null,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE
-                    or DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
-                    or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
-                    or VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
-                    or VIRTUAL_DISPLAY_FLAG_TRUSTED
-                    or VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
-                    or VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED
-                    or VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED
-                    or VIRTUAL_DISPLAY_FLAG_OWN_FOCUS
-            )
+            val flags = (DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE
+                or DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+                or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                or VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
+                or VIRTUAL_DISPLAY_FLAG_TRUSTED
+                or VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP
+                or VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED
+                or VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED
+                or VIRTUAL_DISPLAY_FLAG_OWN_FOCUS)
+            mVirtualDisplay = createVirtualDisplay(displayName, width, height, densityDpi, flags)
         } finally {
             AndroidHook.DisplayGroupIsolation.release(displayName)
             Binder.restoreCallingIdentity(indent)
@@ -189,6 +183,59 @@ class AaVirtualDisplayAdapter(
             startHomeLauncher()
         }
         onVirtualDisplayCreated(mDisplayId)
+    }
+
+    private fun createVirtualDisplay(
+        displayName: String,
+        width: Int,
+        height: Int,
+        densityDpi: Int,
+        flags: Int,
+    ): VirtualDisplay {
+        // Resolve the newer config API reflectively so Android 12/13 can keep the original path.
+        val configuredCreation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            runCatching {
+                val frameworkLoader = DisplayManager::class.java.classLoader
+                val configClass = Class.forName("android.hardware.display.VirtualDisplayConfig", false, frameworkLoader)
+                val builderClass = Class.forName("android.hardware.display.VirtualDisplayConfig\$Builder", false, frameworkLoader)
+                val createMethod = DisplayManager::class.java.getMethod("createVirtualDisplay", configClass)
+                check(createMethod.returnType == VirtualDisplay::class.java)
+                val builder = builderClass.newInstance(
+                    args(displayName, width, height, densityDpi),
+                    argTypes(String::class.java, Integer.TYPE, Integer.TYPE, Integer.TYPE),
+                )
+                builder.invokeMethod("setFlags", args(flags), argTypes(Integer.TYPE))
+                builder.invokeMethod("setIgnoreActivitySizeRestrictions", args(true), argTypes(java.lang.Boolean.TYPE))
+                // Surface stays null until setSurface(), just as in the original creation path.
+                val displayConfig = builder.invokeMethod("build")
+                    ?: throw IllegalStateException("VirtualDisplayConfig.Builder.build returned null")
+                val enabled = displayConfig.invokeMethod("isIgnoreActivitySizeRestrictions") as? Boolean
+                    ?: throw IllegalStateException("VirtualDisplayConfig size restriction state is not boolean")
+                log(TAG, "VirtualDisplay size policy: sdk=${Build.VERSION.SDK_INT}, " +
+                    "ignoreActivitySizeRestrictions=" + (if (enabled) "enabled in config" else "disabled by system feature flag"))
+                createMethod to displayConfig
+            }.onFailure { error ->
+                if (error is ClassNotFoundException || error is NoSuchMethodException) {
+                    log(TAG, "VirtualDisplay size policy: sdk=${Build.VERSION.SDK_INT}, " +
+                        "API unavailable; using original creation")
+                } else {
+                    log(TAG, "VirtualDisplay size policy: configuration failed; using original creation", error)
+                }
+            }.getOrNull()
+        } else {
+            log(TAG, "VirtualDisplay size policy: sdk=${Build.VERSION.SDK_INT}, " +
+                "API unavailable; using original creation")
+            null
+        }
+
+        // Only preparation may fall back. Never retry a failed display creation with another API.
+        return if (configuredCreation != null) {
+            configuredCreation.first.invoke(Instances.displayManager, configuredCreation.second) as? VirtualDisplay
+                ?: throw IllegalStateException("Configured virtual display creation returned null")
+        } else {
+            Instances.displayManager.createVirtualDisplay(displayName, width, height, densityDpi, null, flags)
+                ?: throw IllegalStateException("Virtual display creation returned null")
+        }
     }
 
     fun onReconnected(width: Int, height: Int, densityDpi: Int){

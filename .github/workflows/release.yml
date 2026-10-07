@@ -1,13 +1,22 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
-    paths: [version.conf]
   workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Mark this release as a prerelease
+        type: boolean
+        default: true
 
 permissions:
   contents: write
+
+# Allocate versions only after the preceding release has finished publishing.
+concurrency:
+  group: aadisplay-release
+  cancel-in-progress: false
+  # GitHub supports queued runs; keep pending manual releases instead of replacing them.
+  queue: max
 
 jobs:
   release:
@@ -16,15 +25,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Read version.conf
+      - name: Test release version generation
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_*.py'
+
+      - name: Generate release version
         id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          while IFS='=' read -r key value; do
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            [[ -z "$key" || "$key" == \#* ]] && continue
-            echo "${key}=${value}" >> "$GITHUB_OUTPUT"
-          done < version.conf
+          git ls-remote --tags origin > "$RUNNER_TEMP/release-tags.txt"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate --jq '.[].tag_name' > "$RUNNER_TEMP/release-names.txt"
+          python3 -B .github/scripts/generate_release_version.py \
+            --tags-file "$RUNNER_TEMP/release-tags.txt" \
+            --releases-file "$RUNNER_TEMP/release-names.txt" >> "$GITHUB_OUTPUT"
 
       - name: Validate secrets
         run: |
@@ -42,8 +56,9 @@ jobs:
       - name: Check tag does not already exist
         run: |
           TAG="v${{ steps.version.outputs.VERSION_NAME }}"
-          if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
-            echo "::error::Tag $TAG already exists. Bump VERSION_NAME in version.conf before releasing."
+          TAG_REF=$(git ls-remote --tags origin "refs/tags/$TAG")
+          if [ -n "$TAG_REF" ]; then
+            echo "::error::Tag $TAG was created after version allocation. Run the workflow again to allocate a new version."
             exit 1
           fi
           echo "Tag $TAG is available."
@@ -63,6 +78,8 @@ jobs:
 
       - name: Build and verify release APK
         env:
+          AADISPLAY_VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
+          AADISPLAY_VERSION_CODE: ${{ steps.version.outputs.VERSION_CODE }}
           ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/release-keystore.jks
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -78,10 +95,11 @@ jobs:
           TAG="v${{ steps.version.outputs.VERSION_NAME }}"
           APK=$(find aa-display/build/outputs/apk/release -name '*.apk' | head -1)
           PRERELEASE_FLAG=""
-          if [ "${{ steps.version.outputs.PRERELEASE }}" = "true" ]; then
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
             PRERELEASE_FLAG="--prerelease"
           fi
           gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
             --title "AADisplay-101 ${{ steps.version.outputs.VERSION_NAME }}" \
             --notes "Release ${{ steps.version.outputs.VERSION_NAME }}" \
             --draft \

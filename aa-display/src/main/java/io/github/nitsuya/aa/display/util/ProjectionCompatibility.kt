@@ -96,6 +96,26 @@ internal class AcquiredResource {
     }
 }
 
+/** Context requires unbinding even when bindService returns false or throws. Main-thread owned. */
+internal class ServiceBinding {
+    var attempted = false
+        private set
+    private var cleanupRequired = false
+
+    fun bind(action: () -> Boolean): Boolean {
+        check(!attempted)
+        attempted = true
+        cleanupRequired = true
+        return action()
+    }
+
+    fun unbind(action: () -> Unit): Throwable? {
+        if (!cleanupRequired) return null
+        cleanupRequired = false
+        return runCatching(action).exceptionOrNull()
+    }
+}
+
 /** Each optional display policy has separate request and readback failure boundaries. */
 internal object DisplayPolicyRequests {
     data class Outcome(val requested: Any, val setterAvailable: Boolean, val set: Boolean, val actual: Any?)
@@ -139,6 +159,22 @@ internal class ProjectionLifecycle {
         destroyed = true
         coreReady = false
         return true
+    }
+
+    @Synchronized fun canStartInput(displayId: Int): Boolean =
+        !destroyed && coreReady && displayId > 0
+}
+
+/** Input order is independent of teardown. An admitted platform call may finish after retirement. */
+internal class ProjectionInput(private val lifecycle: ProjectionLifecycle) {
+    private val orderLock = Any()
+
+    fun sequence(action: () -> Unit) = synchronized(orderLock) { action() }
+
+    fun event(displayId: Int, action: (Int) -> Unit): Boolean = synchronized(orderLock) {
+        if (!lifecycle.canStartInput(displayId)) return@synchronized false
+        action(displayId)
+        true
     }
 }
 

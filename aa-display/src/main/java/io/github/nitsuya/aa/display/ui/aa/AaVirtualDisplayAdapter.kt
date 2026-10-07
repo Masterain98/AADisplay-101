@@ -26,6 +26,8 @@ import io.github.nitsuya.aa.display.service.ShellManagerService
 import io.github.nitsuya.aa.display.util.AADisplayConfig
 import io.github.nitsuya.aa.display.util.ProjectionCompatibility
 import io.github.nitsuya.aa.display.util.ProjectionLifecycle
+import io.github.nitsuya.aa.display.util.ProjectionInput
+import io.github.nitsuya.aa.display.util.ServiceBinding
 import io.github.nitsuya.aa.display.util.DisplayPolicyRequests
 import io.github.nitsuya.aa.display.util.InjectionDiagnostics
 import io.github.nitsuya.aa.display.util.argTypes
@@ -89,11 +91,12 @@ class AaVirtualDisplayAdapter(
     public lateinit var mVirtualDisplay: VirtualDisplay
     private var mDisplayWindowManager: WindowManager? = null
     private var forceViewAdded = false
-    private var serviceBound = false
+    private val serviceBinding = ServiceBinding()
     private var listenerRegistered = false
     private var shellPrepared = false
     private val lifecycle = ProjectionLifecycle()
-    private val inputLock = Any()
+    private val input = ProjectionInput(lifecycle)
+    private val mirrorLock = Any()
     private val injectionDiagnostics = InjectionDiagnostics(runCatching {
         AADisplayConfig.DebugInputInjectionLog.get(config)
     }.getOrDefault(false))
@@ -135,15 +138,14 @@ class AaVirtualDisplayAdapter(
 
     fun initialize() {
         check(Looper.myLooper() == Looper.getMainLooper())
-        if (lifecycle.destroyed || serviceBound) return
-        serviceBound = runCatching {
-            context.bindService(Intent(ShellManagerService::class.java.name).apply {
+        if (lifecycle.destroyed || serviceBinding.attempted) return
+        val bound = runCatching {
+            serviceBinding.bind { context.bindService(Intent(ShellManagerService::class.java.name).apply {
                 setPackage(BuildConfig.APPLICATION_ID)
-            }, mServiceConnection, AppCompatActivity.BIND_AUTO_CREATE)
+            }, mServiceConnection, AppCompatActivity.BIND_AUTO_CREATE) }
         }.onFailure { log(TAG, "shell binding failed", it) }.getOrDefault(false)
-        if (!serviceBound) {
-            onFailure(this)
-            onDestroy()
+        if (!bound) {
+            try { onFailure(this) } finally { onDestroy() }
         }
     }
 
@@ -337,12 +339,10 @@ class AaVirtualDisplayAdapter(
 
     fun onDestroy() {
         check(Looper.myLooper() == Looper.getMainLooper())
-        val displayId: Int
-        synchronized(inputLock) {
-            if (!lifecycle.destroy()) return
-            displayId = mDisplayId
-            mDisplayId = Display.INVALID_DISPLAY
-        }
+        // Do not wait for a synchronous input injection while retiring this session.
+        if (!lifecycle.destroy()) return
+        val displayId = mDisplayId
+        mDisplayId = Display.INVALID_DISPLAY
         if (listenerRegistered) {
             listenerRegistered = false
             tryOrNull { Instances.iActivityTaskManager.unregisterTaskStackListener(mTaskStackListener) }
@@ -357,12 +357,14 @@ class AaVirtualDisplayAdapter(
                 }
             }
         }
-        if (serviceBound) {
-            serviceBound = false
-            tryOrNull { context.unbindService(mServiceConnection) }
+        serviceBinding.unbind { context.unbindService(mServiceConnection) }?.let {
+            log(TAG, "shell binding cleanup failed", it)
         }
-        mSurfaceControls.values.forEach { tryOrNull { it.release() } }
-        mSurfaceControls.clear()
+        synchronized(mirrorLock) {
+            mSurfaceControls.values.forEach { tryOrNull { it.release() } }
+            mSurfaceControls.clear()
+            tryOrNull { mTransaction.close() }
+        }
         if (forceViewAdded) {
             forceViewAdded = false
             tryOrNull { mForceView?.let { mDisplayWindowManager?.removeView(it) } }
@@ -370,7 +372,6 @@ class AaVirtualDisplayAdapter(
         mForceView = null
         mDisplayWindowManager = null
         if (::mVirtualDisplay.isInitialized) tryOrNull { mVirtualDisplay.release() }
-        tryOrNull { mTransaction.close() }
         mDensityDpi = 0
         if (shellPrepared) tryOrNull { mShellManager?.destroyVirtualDisplayAfter() }
         shellPrepared = false
@@ -384,12 +385,13 @@ class AaVirtualDisplayAdapter(
     fun onTouch(event: MotionEvent) = injectInputEvent(event)
 
     fun onPressKey(action: Int) {
-        synchronized(inputLock) {
-            if (!isReady || mDisplayId <= Display.DEFAULT_DISPLAY) return
-            if (ProjectionCompatibility.needsNavigationTouchMode(Build.VERSION.SDK_INT, action, mDisplayId)) {
+        input.sequence {
+            val displayId = mDisplayId
+            if (!lifecycle.canStartInput(displayId)) return@sequence
+            if (ProjectionCompatibility.needsNavigationTouchMode(Build.VERSION.SDK_INT, action, displayId)) {
                 runCatching {
                     val setter = navigationTouchMode ?: error("per-display setInTouchMode unavailable")
-                    setter.invoke(Instances.iWindowManager, false, mDisplayId)
+                    setter.invoke(Instances.iWindowManager, false, displayId)
                 }.onFailure {
                     if (navigationDiagnostics.shouldWarn(System.nanoTime())) log(TAG, "navigation touch mode unavailable; keys still injected", it)
                 }
@@ -397,19 +399,20 @@ class AaVirtualDisplayAdapter(
             val uptimeMillis = SystemClock.uptimeMillis()
             injectInputEvent(KeyEvent(uptimeMillis, uptimeMillis, KeyEvent.ACTION_DOWN, action, 0).apply {
                 source = InputDevice.SOURCE_KEYBOARD
-            })
+            }, displayId)
             injectInputEvent(KeyEvent(uptimeMillis, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, action, 0).apply {
                 source = InputDevice.SOURCE_KEYBOARD
-            })
+            }, displayId)
         }
     }
 
     fun addMirror(surfaceControl: SurfaceControl){
-        synchronized(inputLock) {
-            if (!isReady || mDisplayId <= Display.DEFAULT_DISPLAY) return
+        synchronized(mirrorLock) {
+            val displayId = mDisplayId
+            if (!lifecycle.canStartInput(displayId)) return
             val sc = SurfaceControl::class.java.newInstance(args(), argTypes()) as SurfaceControl
             try{
-                if(!Instances.iWindowManager.mirrorDisplay(mDisplayId, sc)){
+                if(!Instances.iWindowManager.mirrorDisplay(displayId, sc)){
                     sc.release()
                     return
                 }
@@ -441,7 +444,7 @@ class AaVirtualDisplayAdapter(
     }
 
     fun removeMirror(surfaceControl: SurfaceControl){
-        synchronized(inputLock) {
+        synchronized(mirrorLock) {
             if (!isReady) return
             mSurfaceControls.remove(surfaceControl)?.also {sc ->
                 try {
@@ -611,17 +614,16 @@ class AaVirtualDisplayAdapter(
         )
     }
 
-    private fun injectInputEvent(event: InputEvent) {
-        synchronized(inputLock) {
-            if (!isReady || mDisplayId <= Display.DEFAULT_DISPLAY) return
+    private fun injectInputEvent(event: InputEvent, displayId: Int = mDisplayId) {
+        input.event(displayId) { targetDisplayId ->
             val started = System.nanoTime()
             var ok = false
             try {
-                event.invokeMethod("setDisplayId", args(mDisplayId), argTypes(Integer.TYPE))
+                event.invokeMethod("setDisplayId", args(targetDisplayId), argTypes(Integer.TYPE))
                 ok = Instances.iInputManager.injectInputEvent(event, INJECT_INPUT_EVENT_MODE_WAIT_FOR_RESULT)
-                if (!ok && injectionDiagnostics.shouldWarn(System.nanoTime())) log(TAG, "input injection rejected: displayId=$mDisplayId")
+                if (!ok && injectionDiagnostics.shouldWarn(System.nanoTime())) log(TAG, "input injection rejected: displayId=$targetDisplayId")
             } catch (error: Throwable) {
-                if (injectionDiagnostics.shouldWarn(System.nanoTime())) log(TAG, "input injection failed: displayId=$mDisplayId", error)
+                if (injectionDiagnostics.shouldWarn(System.nanoTime())) log(TAG, "input injection failed: displayId=$targetDisplayId", error)
             } finally {
                 injectionDiagnostics.record(ok, System.nanoTime() - started)
             }
